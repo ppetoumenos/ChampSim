@@ -4,11 +4,11 @@
 #include "../../inc/cache.h"
 #include "../../inc/ooo_cpu.h"
 
-constexpr int HISTORY = 8;
-constexpr int GRANULARITY = 8;
-constexpr int SAMPLED_CACHE_WAYS = 5;
-constexpr int LOG2_SAMPLED_CACHE_SETS = 4;
-constexpr int TIMESTAMP_BITS = 8;
+constexpr uint32_t HISTORY = 8;
+constexpr uint32_t GRANULARITY = 8;
+constexpr uint32_t SAMPLED_CACHE_WAYS = 5;
+constexpr uint32_t LOG2_SAMPLED_CACHE_SETS = 4;
+constexpr uint32_t TIMESTAMP_BITS = 8;
 
 constexpr double TEMP_DIFFERENCE = 1.0/16.0;
 constexpr double FLEXMIN_PENALTY = 2.0 - lg2(NUM_CPUS)/4.0;
@@ -71,9 +71,9 @@ class MJData {
 		}
 	}
 
-	bool is_sampled_set(int set) {
-		int mask_length = LOG2_SETS - LOG2_SAMPLED_SETS;
-		int mask = (1 << mask_length) - 1;
+	bool is_sampled_set(uint32_t set) {
+		uint32_t mask_length = LOG2_SETS - LOG2_SAMPLED_SETS;
+		uint32_t mask = (1 << mask_length) - 1;
 		return (set & mask) == ((set >> (LOG2_SETS - mask_length)) & mask);
 	}
 
@@ -124,11 +124,10 @@ class MJData {
 		return -1;
 	}
 
-	void detrain(uint32_t set, int way) {
+	void detrain(uint32_t set, uint32_t way) {
 		SampledCacheLine temp = sampled_cache[set][way];
-		if (!temp.valid) {
+		if (!temp.valid)
 			return;
-		}
 
 		if (rdp.count(temp.signature)) {
 			rdp[temp.signature] = min(rdp[temp.signature] + 1, INF_RD);
@@ -138,7 +137,7 @@ class MJData {
 		sampled_cache[set][way].valid = false;
 	}
 
-	int temporal_difference(int init, int sample) {
+	uint32_t temporal_difference(uint32_t init, uint32_t sample) {
 		if (sample > init) {
 			uint32_t diff = sample - init;
 			diff = diff * TEMP_DIFFERENCE;
@@ -148,23 +147,21 @@ class MJData {
 			int diff = init - sample;
 			diff = diff * TEMP_DIFFERENCE;
 			diff = min(1, diff);
-			return max(init - diff, 0);
+			return max(init - diff, 0u);
 		} else {
 			return init;
 		}
 	}
 
-	int increment_timestamp(int input) {
+	uint32_t increment_timestamp(uint32_t input) {
 		input++;
 		input = input % (1 << TIMESTAMP_BITS);
 		return input;
 	}
 
-	int time_elapsed(int global, int local) {
-		if (global >= local) {
-			return global - local;
-		}
-		global = global + (1 << TIMESTAMP_BITS);
+	uint32_t time_elapsed(uint32_t global, uint32_t local) {
+		if (global < local) 
+			global += (1 << TIMESTAMP_BITS);
 		return global - local;
 	}
 
@@ -172,9 +169,9 @@ class MJData {
 
 
 	uint32_t find_victim(uint32_t cpu, uint32_t set, uint64_t pc, uint32_t type) {
-		int max_etr = 0;
-		int victim_way = 0;
-		for (int way = 0; way < NUM_WAY; way++) {
+		uint32_t max_etr = 0;
+		uint32_t victim_way = 0;
+		for (uint32_t way = 0; way < NUM_WAY; ++way) {
 			if (abs(etr[set][way]) > max_etr ||
 					(abs(etr[set][way]) == max_etr &&
 							etr[set][way] < 0)) {
@@ -194,15 +191,12 @@ class MJData {
 
 	void update_replacement_state(uint32_t cpu, uint32_t set, uint32_t way, uint64_t full_addr, uint64_t pc, uint64_t victim_addr, uint32_t type, uint8_t hit) {
 		if (type == WRITEBACK) {
-			if(!hit) {
+			if(!hit)
 				etr[set][way] = -INF_ETR;
-			}
 			return;
 		}
-			
 
 		pc = get_pc_signature(pc, hit, type == PREFETCH, cpu);
-
 
 		if (is_sampled_set(set)) {
 			uint32_t sampled_cache_index = get_sampled_cache_index(full_addr);
@@ -211,15 +205,15 @@ class MJData {
 
 			if (sampled_cache_way > -1) {
 				uint64_t last_signature = sampled_cache[sampled_cache_index][sampled_cache_way].signature;
-				uint64_t last_timestamp = sampled_cache[sampled_cache_index][sampled_cache_way].timestamp;
-				int sample = time_elapsed(current_timestamp[set], last_timestamp);
+				uint32_t last_timestamp = sampled_cache[sampled_cache_index][sampled_cache_way].timestamp;
+				uint32_t sample = time_elapsed(current_timestamp[set], last_timestamp);
 
 				if (sample <= INF_RD) {
-					if (type == PREFETCH) {
-						sample = sample * FLEXMIN_PENALTY;
-					}
+					if (type == PREFETCH)
+						sample *= FLEXMIN_PENALTY;
+
 					if (rdp.count(last_signature)) {
-						int init = rdp[last_signature];
+						uint32_t init = rdp[last_signature];
 						rdp[last_signature] = temporal_difference(init, sample);
 					} else {
 						rdp[last_signature] = sample;
@@ -232,27 +226,27 @@ class MJData {
 
 			int lru_way = -1;
 			int lru_rd = -1;
-			for (int w = 0; w < SAMPLED_CACHE_WAYS; w++) {
+			for (uint32_t w = 0; w < SAMPLED_CACHE_WAYS; ++w) {
 				if (sampled_cache[sampled_cache_index][w].valid == false) {
 					lru_way = w;
 					lru_rd = INF_RD + 1;
 					continue;
 				}
 
-				uint64_t last_timestamp = sampled_cache[sampled_cache_index][w].timestamp;
-				int sample = time_elapsed(current_timestamp[set], last_timestamp);
+				uint32_t last_timestamp = sampled_cache[sampled_cache_index][w].timestamp;
+				uint32_t sample = time_elapsed(current_timestamp[set], last_timestamp);
 				if (sample > INF_RD) {
 					lru_way = w;
 					lru_rd = INF_RD + 1;
 					detrain(sampled_cache_index, w);
-				} else if (sample > lru_rd) {
+				} else if (lru_rd < 0 || sample > lru_rd) {
 					lru_way = w;
 					lru_rd = sample;
 				}
 			}
 			detrain(sampled_cache_index, lru_way);
 
-			for (int w = 0; w < SAMPLED_CACHE_WAYS; w++) {
+			for (uint32_t w = 0; w < SAMPLED_CACHE_WAYS; ++w) {
 				if (sampled_cache[sampled_cache_index][w].valid == false) {
 					sampled_cache[sampled_cache_index][w].valid = true;
 					sampled_cache[sampled_cache_index][w].signature = pc;
@@ -261,13 +255,12 @@ class MJData {
 					break;
 				}
 			}
-			
 			current_timestamp[set] = increment_timestamp(current_timestamp[set]);
 		}
 
 		if(etr_clock[set] == GRANULARITY) {
-			for (int w = 0; w < NUM_WAY; w++) {
-				if ((uint32_t) w != way && abs(etr[set][w]) < INF_ETR) {
+			for (uint32_t w = 0; w < NUM_WAY; ++w) {
+				if (w != way && abs(etr[set][w]) < INF_ETR) {
 					etr[set][w]--;
 				}
 			}
@@ -315,7 +308,7 @@ uint32_t CACHE::find_victim(uint32_t cpu, uint64_t instr_id, uint32_t set, const
 {
     /* don't modify this code or put anything above it;
      * if there's an invalid block, we don't need to evict any valid ones */
-    for (int way = 0; way < NUM_WAY; way++) {
+    for (uint32_t way = 0; way < NUM_WAY; ++way) {
         if (current_set[way].valid == false) {
             return way;
         }
