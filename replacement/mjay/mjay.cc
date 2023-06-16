@@ -22,12 +22,37 @@ uint64_t CRC_HASH( uint64_t _blockAddress )
     return _returnVal;
 }
 
+template <uint32_t bits>
+class Counter {
+	uint32_t num{0};
+
+public:
+	Counter() = default;
+
+	Counter(const Counter& other) {
+		num = other.num;
+	}
+
+	Counter& operator++() {
+		num = (num + 1) & bitmask(bits);
+		return *this;
+	}
+
+	uint32_t operator-(const Counter& other) {
+		uint32_t val = num;
+		if (val < other.num)
+			val += (1 << bits);
+		return val - other.num;
+	}
+};
+
+using Timestamp = Counter<TIMESTAMP_BITS>;
+
 struct SampledCacheLine {
     bool valid;
     uint64_t tag;
     uint64_t signature;
-    //Counter<TIMESTAMP_BITS> timestamp;
-    uint32_t timestamp;
+    Timestamp timestamp;
 };
 
 class MJData {
@@ -39,8 +64,7 @@ class MJData {
 
 	std::vector<std::vector<int32_t>> etr;
 	std::vector<uint32_t> etr_clock;
-	//std::vector<Counter<TIMESTAMP_BITS>> current_timestamp;
-	std::vector<uint32_t> current_timestamp;
+	std::vector<Timestamp> current_timestamp;
 
 	std::unordered_map<uint32_t, uint32_t> rdp;
 	//std::unordered_map<uint32_t, std::vector<SampledCacheLine>> sampled_cache;
@@ -153,19 +177,6 @@ class MJData {
 		}
 	}
 
-	uint32_t increment_timestamp(uint32_t input) {
-		input++;
-		input = input % (1 << TIMESTAMP_BITS);
-		return input;
-	}
-
-	uint32_t time_elapsed(uint32_t global, uint32_t local) {
-		if (global < local) 
-			global += (1 << TIMESTAMP_BITS);
-		return global - local;
-	}
-
-
 
 
 	uint32_t find_victim(uint32_t cpu, uint32_t set, uint64_t pc, uint32_t type) {
@@ -205,8 +216,7 @@ class MJData {
 
 			if (sampled_cache_way > -1) {
 				uint64_t last_signature = sampled_cache[sampled_cache_index][sampled_cache_way].signature;
-				uint32_t last_timestamp = sampled_cache[sampled_cache_index][sampled_cache_way].timestamp;
-				uint32_t sample = time_elapsed(current_timestamp[set], last_timestamp);
+				uint32_t sample = current_timestamp[set] - sampled_cache[sampled_cache_index][sampled_cache_way].timestamp;
 
 				if (sample <= INF_RD) {
 					if (type == PREFETCH)
@@ -233,8 +243,7 @@ class MJData {
 					continue;
 				}
 
-				uint32_t last_timestamp = sampled_cache[sampled_cache_index][w].timestamp;
-				uint32_t sample = time_elapsed(current_timestamp[set], last_timestamp);
+				uint32_t sample = current_timestamp[set] - sampled_cache[sampled_cache_index][w].timestamp;
 				if (sample > INF_RD) {
 					lru_way = w;
 					lru_rd = INF_RD + 1;
@@ -255,7 +264,7 @@ class MJData {
 					break;
 				}
 			}
-			current_timestamp[set] = increment_timestamp(current_timestamp[set]);
+			++current_timestamp[set];
 		}
 
 		if(etr_clock[set] == GRANULARITY) {
@@ -286,10 +295,6 @@ class MJData {
 		}
 	}
 };
-
-
-
-
 
 std::unordered_map<CACHE*, MJData> mjay;
 
