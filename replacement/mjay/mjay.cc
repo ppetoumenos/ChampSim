@@ -1,5 +1,7 @@
 #include <cstdlib>
+#include <optional>
 #include <unordered_map>
+#include <vector>
 
 #include "../../inc/cache.h"
 #include "../../inc/ooo_cpu.h"
@@ -16,9 +18,10 @@ constexpr double FLEXMIN_PENALTY = 2.0 - lg2(NUM_CPUS)/4.0;
 uint64_t CRC_HASH( uint64_t _blockAddress )
 {
     static const unsigned long long crcPolynomial = 3988292384ULL;
-    unsigned long long _returnVal = _blockAddress;
-    for( unsigned int i = 0; i < 3; i++)
-        _returnVal = ( ( _returnVal & 1 ) == 1 ) ? ( ( _returnVal >> 1 ) ^ crcPolynomial ) : ( _returnVal >> 1 );
+    uint64_t _returnVal = _blockAddress;
+	_returnVal = ( ( _returnVal & 1 ) == 1 ) ? ( ( _returnVal >> 1 ) ^ crcPolynomial ) : ( _returnVal >> 1 );
+	_returnVal = ( ( _returnVal & 1 ) == 1 ) ? ( ( _returnVal >> 1 ) ^ crcPolynomial ) : ( _returnVal >> 1 );
+	_returnVal = ( ( _returnVal & 1 ) == 1 ) ? ( ( _returnVal >> 1 ) ^ crcPolynomial ) : ( _returnVal >> 1 );
     return _returnVal;
 }
 
@@ -76,35 +79,9 @@ class MJData {
 	std::unordered_map<uint32_t, uint32_t> rdp;
 	std::unordered_map<uint32_t, std::vector<SampledCacheLine>> sampled_cache;
 
-	public:
-	MJData(uint32_t num_set, uint32_t num_way) :
-		NUM_SET{num_set}, NUM_WAY{num_way},
-		LOG2_SETS{lg2(num_set)},
-		LOG2_SIZE{LOG2_SETS + lg2(num_way) + LOG2_BLOCK_SIZE},
-		LOG2_SAMPLED_SETS{LOG2_SIZE - 16},
-		INF_RD{NUM_WAY * HISTORY - 1},
-		INF_ETR{(NUM_WAY * HISTORY / GRANULARITY) - 1},
-		MAX_RD{INF_RD - 22},
-		SAMPLED_CACHE_TAG_BITS{31 - LOG2_SIZE},
-		PC_SIGNATURE_BITS{LOG2_SIZE - 10},
-		etr(NUM_SET), etr_clock(NUM_SET), current_timestamp(NUM_SET)
-   	{
-		int modifier = 1 << LOG2_SETS;
-		int limit = 1 << LOG2_SAMPLED_CACHE_SETS;
-
-		for(uint32_t set = 0; set < NUM_SET; ++set) {
-			etr[set].resize(NUM_WAY);
-			etr_clock[set] = GRANULARITY;
-			if (is_sampled_set(set)) 
-				for (int i = 0; i < limit; i++)
-					//sampled_cache[set + modifier*i] = new SampledCacheLine[SAMPLED_CACHE_WAYS]();
-					sampled_cache.emplace(set + modifier*i, SAMPLED_CACHE_WAYS);
-		}
-	}
-
 	bool is_sampled_set(uint32_t set) {
 		uint32_t mask_length = LOG2_SETS - LOG2_SAMPLED_SETS;
-		uint32_t mask = (1 << mask_length) - 1;
+		uint32_t mask = bitmask(mask_length);
 		return (set & mask) == ((set >> (LOG2_SETS - mask_length)) & mask);
 	}
 
@@ -145,27 +122,22 @@ class MJData {
 		return x;
 	}
 
-	int search_sampled_cache(uint64_t blockAddress, uint32_t set) {
-		auto sampled_set = sampled_cache[set];
-		for (int way = 0; way < SAMPLED_CACHE_WAYS; way++) {
-			if (sampled_set[way].valid && (sampled_set[way].tag == blockAddress)) {
-				return way;
-			}
-		}
-		return -1;
+	std::optional<uint32_t> search_sampled_cache(uint64_t blockAddress, uint32_t set) {
+		auto it = std::find_if(sampled_cache[set].begin(), sampled_cache[set].end(), [&](SampledCacheLine& entry) {return (entry.valid && entry.tag == blockAddress);});
+		if (it != sampled_cache[set].end())
+			return std::distance(sampled_cache[set].begin(), it);
+		return {};
 	}
 
 	void detrain(uint32_t set, uint32_t way) {
 		SampledCacheLine& temp = sampled_cache[set][way];
 		if (!temp.valid)
 			return;
-
-		if (rdp.count(temp.signature)) {
-			rdp[temp.signature] = min(rdp[temp.signature] + 1, INF_RD);
-		} else {
-			rdp[temp.signature] = INF_RD;
-		}
 		temp.valid = false;
+
+		auto [rdp_it, inserted] = rdp.emplace(temp.signature, INF_RD);
+		if (!inserted)
+			rdp_it->second = min(rdp_it->second + 1, INF_RD);
 	}
 
 	uint32_t temporal_difference(uint32_t init, uint32_t sample) {
@@ -174,35 +146,62 @@ class MJData {
 			diff = diff * TEMP_DIFFERENCE;
 			diff = min(1u, diff);
 			return min(init + diff, INF_RD);
-		} else if (sample < init) {
-			int diff = init - sample;
+		}
+
+		if (sample < init) {
+			uint32_t diff = init - sample;
 			diff = diff * TEMP_DIFFERENCE;
-			diff = min(1, diff);
+			diff = min(1u, diff);
 			return init - diff;
-		} else {
-			return init;
+		} 
+		
+		return init;
+	}
+
+	public:
+	MJData(uint32_t num_set, uint32_t num_way) :
+		NUM_SET{num_set}, NUM_WAY{num_way},
+		LOG2_SETS{lg2(num_set)},
+		LOG2_SIZE{LOG2_SETS + lg2(num_way) + LOG2_BLOCK_SIZE},
+		LOG2_SAMPLED_SETS{LOG2_SIZE - 16},
+		INF_RD{NUM_WAY * HISTORY - 1},
+		INF_ETR{(NUM_WAY * HISTORY / GRANULARITY) - 1},
+		MAX_RD{INF_RD - 22},
+		SAMPLED_CACHE_TAG_BITS{31 - LOG2_SIZE},
+		PC_SIGNATURE_BITS{LOG2_SIZE - 10},
+		etr(NUM_SET), etr_clock(NUM_SET), current_timestamp(NUM_SET)
+   	{
+		uint32_t modifier = 1 << LOG2_SETS;
+		uint32_t limit = 1 << LOG2_SAMPLED_CACHE_SETS;
+
+		for(uint32_t set = 0; set < NUM_SET; ++set) {
+			etr[set].resize(NUM_WAY);
+			etr_clock[set] = GRANULARITY;
+			if (is_sampled_set(set)) 
+				for (uint32_t i = 0; i < limit; i++)
+					sampled_cache.emplace(set + modifier*i, SAMPLED_CACHE_WAYS);
 		}
 	}
 
 
-
 	uint32_t find_victim(uint32_t cpu, uint32_t set, uint64_t pc, uint32_t type) {
-		uint32_t max_etr = 0;
+		auto victim_it = std::min_element(etr[set].begin(), etr[set].end(),
+				[](int32_t num1, int32_t num2) {
+					return (abs(num1) > abs(num2) || (abs(num1) == abs(num2) && num1 < 0));
+				});
 		uint32_t victim_way = 0;
-		for (uint32_t way = 0; way < NUM_WAY; ++way) {
-			if (abs(etr[set][way]) > max_etr ||
-					(abs(etr[set][way]) == max_etr &&
-							etr[set][way] < 0)) {
-				max_etr = abs(etr[set][way]);
-				victim_way = way;
-			}
+		uint32_t max_etr = 0;
+		if (victim_it != etr[set].end()) {
+			victim_way = std::distance(etr[set].begin(), victim_it);
+			max_etr = abs(etr[set][victim_way]);
 		}
-		
-		uint64_t pc_signature = get_pc_signature(pc, false, type == PREFETCH, cpu);
-		if (type != WRITEBACK && rdp.count(pc_signature) &&
-				(rdp[pc_signature] > MAX_RD || rdp[pc_signature] / GRANULARITY > max_etr)) {
+
+		if (type == WRITEBACK)
+			return victim_way;
+
+		auto rdp_it = rdp.find(get_pc_signature(pc, false, type == PREFETCH, cpu));
+		if (rdp_it != rdp.end() && (rdp_it->second > MAX_RD || rdp_it->second / GRANULARITY > max_etr))
 			return NUM_WAY;
-		}
 		
 		return victim_way;
 	}
@@ -219,24 +218,22 @@ class MJData {
 		if (is_sampled_set(set)) {
 			uint32_t sampled_cache_index = get_sampled_cache_index(full_addr);
 			uint64_t sampled_cache_tag = get_sampled_cache_tag(full_addr);
-			int32_t sampled_cache_way = search_sampled_cache(sampled_cache_tag, sampled_cache_index);
+			std::optional<uint32_t> sampled_cache_way = search_sampled_cache(sampled_cache_tag, sampled_cache_index);
 
 			auto& sampler_set = sampled_cache[sampled_cache_index];
-			SampledCacheLine& sampler_entry = sampler_set[sampled_cache_way];
-			if (sampled_cache_way > -1) {
-				uint64_t last_signature = sampler_entry.signature;
+			if (sampled_cache_way) {
+				SampledCacheLine& sampler_entry = sampler_set[sampled_cache_way.value()];
 				uint32_t sample = current_timestamp[set] - sampler_entry.timestamp;
 
 				if (sample <= INF_RD) {
 					if (type == PREFETCH)
 						sample *= FLEXMIN_PENALTY;
 
-					if (rdp.count(last_signature)) {
-						uint32_t init = rdp[last_signature];
-						rdp[last_signature] = temporal_difference(init, sample);
-					} else {
-						rdp[last_signature] = sample;
-					}
+					// Either create a new rdp entry for the sample or
+					//   get an iterator to the existing one and update it with the sample
+					auto [rdp_it, inserted] = rdp.emplace(sampler_entry.signature, sample);
+					if (!inserted)
+						rdp_it->second = temporal_difference(rdp_it->second, sample);
 
 					sampler_entry.valid = false;
 				}
@@ -257,7 +254,7 @@ class MJData {
 					lru_way = w;
 					lru_rd = INF_RD + 1;
 					detrain(sampled_cache_index, w);
-				} else if (lru_rd < 0 || sample > lru_rd) {
+				} else if (lru_rd < 0 || sample > uint32_t(lru_rd)) {
 					lru_way = w;
 					lru_rd = sample;
 				}
@@ -282,23 +279,14 @@ class MJData {
 			etr_clock[set] = 0;
 		}
 		etr_clock[set]++;
+
+		if (way == NUM_WAY)
+			return;
 		
-		
-		if (way < NUM_WAY) {
-			if(!rdp.count(pc)) {
-				if (NUM_CPUS == 1) {
-					etr[set][way] = 0;
-				} else {
-					etr[set][way] = INF_ETR;
-				}
-			} else {
-				if(rdp[pc] > MAX_RD) {
-					etr[set][way] = INF_ETR;
-				} else {
-					etr[set][way] = rdp[pc] / GRANULARITY;
-				}
-			}
-		}
+		if(!rdp.count(pc))
+			etr[set][way] = (NUM_CPUS == 1) ? 0 : INF_ETR;
+		else
+			etr[set][way] = (rdp[pc] > MAX_RD) ? INF_ETR : rdp[pc] / GRANULARITY;
 	}
 };
 
