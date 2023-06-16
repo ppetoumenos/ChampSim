@@ -49,10 +49,17 @@ public:
 using Timestamp = Counter<TIMESTAMP_BITS>;
 
 struct SampledCacheLine {
-    bool valid;
+    bool valid{false};
     uint64_t tag;
     uint64_t signature;
     Timestamp timestamp;
+
+	void reinit(uint64_t pc, uint64_t tag, Timestamp curr) {
+		valid = true;
+		signature = pc;
+		this->tag = tag;
+		timestamp = curr;
+	}
 };
 
 class MJData {
@@ -67,8 +74,7 @@ class MJData {
 	std::vector<Timestamp> current_timestamp;
 
 	std::unordered_map<uint32_t, uint32_t> rdp;
-	//std::unordered_map<uint32_t, std::vector<SampledCacheLine>> sampled_cache;
-	std::unordered_map<uint32_t, SampledCacheLine*> sampled_cache;
+	std::unordered_map<uint32_t, std::vector<SampledCacheLine>> sampled_cache;
 
 	public:
 	MJData(uint32_t num_set, uint32_t num_way) :
@@ -91,7 +97,8 @@ class MJData {
 			etr_clock[set] = GRANULARITY;
 			if (is_sampled_set(set)) 
 				for (int i = 0; i < limit; i++)
-					sampled_cache[set + modifier*i] = new SampledCacheLine[SAMPLED_CACHE_WAYS]();
+					//sampled_cache[set + modifier*i] = new SampledCacheLine[SAMPLED_CACHE_WAYS]();
+					sampled_cache.emplace(set + modifier*i, SAMPLED_CACHE_WAYS);
 		}
 	}
 
@@ -139,7 +146,7 @@ class MJData {
 	}
 
 	int search_sampled_cache(uint64_t blockAddress, uint32_t set) {
-		SampledCacheLine* sampled_set = sampled_cache[set];
+		auto sampled_set = sampled_cache[set];
 		for (int way = 0; way < SAMPLED_CACHE_WAYS; way++) {
 			if (sampled_set[way].valid && (sampled_set[way].tag == blockAddress)) {
 				return way;
@@ -149,7 +156,7 @@ class MJData {
 	}
 
 	void detrain(uint32_t set, uint32_t way) {
-		SampledCacheLine temp = sampled_cache[set][way];
+		SampledCacheLine& temp = sampled_cache[set][way];
 		if (!temp.valid)
 			return;
 
@@ -158,7 +165,7 @@ class MJData {
 		} else {
 			rdp[temp.signature] = INF_RD;
 		}
-		sampled_cache[set][way].valid = false;
+		temp.valid = false;
 	}
 
 	uint32_t temporal_difference(uint32_t init, uint32_t sample) {
@@ -171,7 +178,7 @@ class MJData {
 			int diff = init - sample;
 			diff = diff * TEMP_DIFFERENCE;
 			diff = min(1, diff);
-			return max(init - diff, 0u);
+			return init - diff;
 		} else {
 			return init;
 		}
@@ -212,11 +219,13 @@ class MJData {
 		if (is_sampled_set(set)) {
 			uint32_t sampled_cache_index = get_sampled_cache_index(full_addr);
 			uint64_t sampled_cache_tag = get_sampled_cache_tag(full_addr);
-			int sampled_cache_way = search_sampled_cache(sampled_cache_tag, sampled_cache_index);
+			int32_t sampled_cache_way = search_sampled_cache(sampled_cache_tag, sampled_cache_index);
 
+			auto& sampler_set = sampled_cache[sampled_cache_index];
+			SampledCacheLine& sampler_entry = sampler_set[sampled_cache_way];
 			if (sampled_cache_way > -1) {
-				uint64_t last_signature = sampled_cache[sampled_cache_index][sampled_cache_way].signature;
-				uint32_t sample = current_timestamp[set] - sampled_cache[sampled_cache_index][sampled_cache_way].timestamp;
+				uint64_t last_signature = sampler_entry.signature;
+				uint32_t sample = current_timestamp[set] - sampler_entry.timestamp;
 
 				if (sample <= INF_RD) {
 					if (type == PREFETCH)
@@ -229,7 +238,7 @@ class MJData {
 						rdp[last_signature] = sample;
 					}
 
-					sampled_cache[sampled_cache_index][sampled_cache_way].valid = false;
+					sampler_entry.valid = false;
 				}
 			}
 
@@ -237,13 +246,13 @@ class MJData {
 			int lru_way = -1;
 			int lru_rd = -1;
 			for (uint32_t w = 0; w < SAMPLED_CACHE_WAYS; ++w) {
-				if (sampled_cache[sampled_cache_index][w].valid == false) {
+				if (!sampler_set[w].valid) {
 					lru_way = w;
 					lru_rd = INF_RD + 1;
 					continue;
 				}
 
-				uint32_t sample = current_timestamp[set] - sampled_cache[sampled_cache_index][w].timestamp;
+				uint32_t sample = current_timestamp[set] - sampler_set[w].timestamp;
 				if (sample > INF_RD) {
 					lru_way = w;
 					lru_rd = INF_RD + 1;
@@ -255,12 +264,9 @@ class MJData {
 			}
 			detrain(sampled_cache_index, lru_way);
 
-			for (uint32_t w = 0; w < SAMPLED_CACHE_WAYS; ++w) {
-				if (sampled_cache[sampled_cache_index][w].valid == false) {
-					sampled_cache[sampled_cache_index][w].valid = true;
-					sampled_cache[sampled_cache_index][w].signature = pc;
-					sampled_cache[sampled_cache_index][w].tag = sampled_cache_tag;
-					sampled_cache[sampled_cache_index][w].timestamp = current_timestamp[set];
+			for (auto& entry: sampler_set) {
+				if (!entry.valid) {
+					entry.reinit(pc, sampled_cache_tag, current_timestamp[set]);
 					break;
 				}
 			}
