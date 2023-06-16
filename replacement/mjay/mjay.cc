@@ -311,14 +311,6 @@ void CACHE::initialize_replacement()
  * current_set: an array of BLOCK, of size 16 */
 uint32_t CACHE::find_victim(uint32_t cpu, uint64_t instr_id, uint32_t set, const BLOCK *current_set, uint64_t pc, uint64_t full_addr, uint32_t type)
 {
-    /* don't modify this code or put anything above it;
-     * if there's an invalid block, we don't need to evict any valid ones */
-    for (uint32_t way = 0; way < NUM_WAY; ++way) {
-        if (current_set[way].valid == false) {
-            return way;
-        }
-    }
-
     // your eviction policy goes here
 	return mjay.at(this).find_victim(cpu, set, pc, type);
 }
