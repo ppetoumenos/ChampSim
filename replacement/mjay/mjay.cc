@@ -1,3 +1,7 @@
+// A slightly cleaner version of Mockingjay (HPCA 2022) that works with the latest versions of Champsim (Jun 2023) and uses modern C++ capabilities
+// Based on the original version (https://github.com/ishanashah/Mockingjay)
+// Functionality should not have changed. All rights belong to the original authors, I guess
+
 #include <cstdlib>
 #include <optional>
 #include <unordered_map>
