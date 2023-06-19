@@ -125,11 +125,11 @@ class MJData
     return full_addr;
   }
 
-  uint64_t get_sampled_cache_tag(uint64_t x) const
+  uint64_t get_sampled_cache_tag(uint64_t full_addr) const
   {
-    x >>= LOG2_SETS + LOG2_BLOCK_SIZE + LOG2_SAMPLED_CACHE_SETS;
-    x = (x << (ADDR_BITS - SAMPLED_CACHE_TAG_BITS)) >> (ADDR_BITS - SAMPLED_CACHE_TAG_BITS);
-    return x;
+    full_addr >>= LOG2_SETS + LOG2_BLOCK_SIZE + LOG2_SAMPLED_CACHE_SETS;
+    full_addr = (full_addr << (ADDR_BITS - SAMPLED_CACHE_TAG_BITS)) >> (ADDR_BITS - SAMPLED_CACHE_TAG_BITS);
+    return full_addr;
   }
 
   std::optional<uint32_t> search_sampled_cache(uint64_t blockAddress, uint32_t set) const
@@ -215,7 +215,7 @@ public:
   void update_replacement_state(uint32_t cpu, uint32_t set, uint32_t way, uint64_t full_addr, uint64_t pc, uint64_t victim_addr, uint32_t type, uint8_t hit)
   {
     if (type == WRITEBACK) {
-      if (hit)
+      if (!hit)
         etr[set][way] = -INF_ETR;
       return;
     }
