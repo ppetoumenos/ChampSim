@@ -4,11 +4,11 @@
 
 #include <cstdlib>
 #include <optional>
-#include <unordered_map>
 #include <vector>
 
-#include "cache.h"
-#include "ooo_cpu.h"
+#include "../../inc/cache.h"
+#include "../../inc/ooo_cpu.h"
+#include <unordered_map>
 
 constexpr uint32_t ADDR_BITS = 64;
 
@@ -60,7 +60,7 @@ struct SampledCacheLine {
   uint64_t signature{0};
   Timestamp timestamp{};
 
-  void reinit(uint64_t pc, uint64_t tag, Timestamp curr)
+  void set(uint64_t pc, uint64_t tag, Timestamp curr)
   {
     valid = true;
     signature = pc;
@@ -69,28 +69,125 @@ struct SampledCacheLine {
   }
 };
 
-class MJData
+class Sampler
 {
-  const uint32_t NUM_SET, NUM_WAY;
   const uint32_t LOG2_SETS, LOG2_SIZE, LOG2_SAMPLED_SETS;
+  const uint32_t SAMPLED_CACHE_TAG_BITS;
+  const uint32_t INF_RD;
 
-  const uint32_t INF_RD, MAX_RD;
-  const int32_t INF_ETR;
-  const uint32_t SAMPLED_CACHE_TAG_BITS, PC_SIGNATURE_BITS;
-
-  std::vector<std::vector<int32_t>> etr;
-  std::vector<uint32_t> etr_clock;
+  std::unordered_map<uint32_t, std::vector<SampledCacheLine>> samples;
   std::vector<Timestamp> current_timestamp;
 
-  std::unordered_map<uint32_t, uint32_t> rdp;
-  std::unordered_map<uint32_t, std::vector<SampledCacheLine>> sampled_cache;
+  uint32_t get_index(uint64_t full_addr) const
+  {
+    full_addr = full_addr >> LOG2_BLOCK_SIZE;
+    full_addr = (full_addr << (ADDR_BITS - (LOG2_SAMPLED_CACHE_SETS + LOG2_SETS))) >> (ADDR_BITS - (LOG2_SAMPLED_CACHE_SETS + LOG2_SETS));
+    return full_addr;
+  }
 
-  bool is_sampled_set(uint32_t set) const
+  uint64_t get_tag(uint64_t full_addr) const
+  {
+    full_addr >>= LOG2_SETS + LOG2_BLOCK_SIZE + LOG2_SAMPLED_CACHE_SETS;
+    full_addr = (full_addr << (ADDR_BITS - SAMPLED_CACHE_TAG_BITS)) >> (ADDR_BITS - SAMPLED_CACHE_TAG_BITS);
+    return full_addr;
+  }
+
+public:
+  Sampler(uint32_t num_cache_set, uint32_t num_cache_way)
+      : LOG2_SETS{lg2(num_cache_set)}, LOG2_SIZE{LOG2_SETS + lg2(num_cache_way) + LOG2_BLOCK_SIZE}, LOG2_SAMPLED_SETS{LOG2_SIZE - 16},
+        SAMPLED_CACHE_TAG_BITS{31 - LOG2_SIZE}, INF_RD{num_cache_way * HISTORY - 1}, current_timestamp(num_cache_set)
+  {
+    uint32_t modifier = 1 << LOG2_SETS;
+    uint32_t limit = 1 << LOG2_SAMPLED_CACHE_SETS;
+
+    for (uint32_t set = 0; set < num_cache_set; ++set)
+      if (is_sampled(set))
+        for (uint32_t i = 0; i < limit; i++)
+          samples.emplace(set + modifier * i, SAMPLED_CACHE_WAYS);
+  }
+
+  bool is_sampled(uint32_t cache_set) const
   {
     uint32_t mask_length = LOG2_SETS - LOG2_SAMPLED_SETS;
     uint32_t mask = bitmask(mask_length);
-    return (set & mask) == ((set >> (LOG2_SETS - mask_length)) & mask);
+    return (cache_set & mask) == ((cache_set >> (LOG2_SETS - mask_length)) & mask);
   }
+
+  std::optional<std::pair<uint64_t, uint32_t>> get_sample(uint32_t cache_set, uint64_t full_addr)
+  {
+    uint64_t tag = get_tag(full_addr);
+    auto& set = samples.at(get_index(full_addr));
+    auto sample_it = std::find_if(set.begin(), set.end(), [&](SampledCacheLine& sample) { return (sample.valid && sample.tag == tag); });
+
+    if (sample_it == set.end())
+      return {};
+
+    uint32_t distance = current_timestamp[cache_set] - sample_it->timestamp;
+    if (distance > INF_RD)
+      return {};
+
+    sample_it->valid = false;
+    return {{sample_it->signature, distance}};
+  }
+
+  std::vector<uint64_t> add_sample(uint32_t cache_set, uint64_t full_addr, uint64_t pc)
+  {
+    std::vector<uint64_t> expired;
+    auto& set = samples.at(get_index(full_addr));
+
+    bool found_invalid = false;
+    bool found_valid = false;
+    uint32_t lru_way = 0;
+    uint32_t lru_rd = 0;
+
+    for (uint32_t way = 0; way < set.size(); ++way) {
+      SampledCacheLine& sample = set[way];
+      if (!sample.valid) {
+        found_invalid = true;
+        continue;
+      }
+
+      uint32_t distance = current_timestamp[cache_set] - sample.timestamp;
+      if (distance > INF_RD) {
+        expired.push_back(sample.signature);
+        sample.valid = false;
+        found_invalid = true;
+      } else if (!found_valid || distance > lru_rd) {
+        lru_way = way;
+        lru_rd = distance;
+        found_valid = true;
+      }
+    }
+
+    if (!found_invalid) {
+      expired.push_back(set[lru_way].signature);
+      set[lru_way].valid = false;
+    }
+
+    for (auto& sample : set) {
+      if (!sample.valid) {
+        sample.set(pc, get_tag(full_addr), current_timestamp[cache_set]);
+        break;
+      }
+    }
+    ++current_timestamp[cache_set];
+    return expired;
+  }
+};
+
+class MJData
+{
+  const uint32_t NUM_SET, NUM_WAY, LOG2_SIZE;
+
+  const uint32_t INF_RD, MAX_RD;
+  const int32_t INF_ETR;
+  const uint32_t PC_SIGNATURE_BITS;
+
+  std::vector<std::vector<int32_t>> etr;
+  std::vector<uint32_t> etr_clock;
+
+  std::unordered_map<uint32_t, uint32_t> rdp;
+  Sampler sampler;
 
   uint64_t get_pc_signature(uint64_t pc, bool hit, bool prefetch, uint32_t core) const
   {
@@ -118,42 +215,6 @@ class MJData
     return pc;
   }
 
-  uint32_t get_sampled_cache_index(uint64_t full_addr) const
-  {
-    full_addr = full_addr >> LOG2_BLOCK_SIZE;
-    full_addr = (full_addr << (ADDR_BITS - (LOG2_SAMPLED_CACHE_SETS + LOG2_SETS))) >> (ADDR_BITS - (LOG2_SAMPLED_CACHE_SETS + LOG2_SETS));
-    return full_addr;
-  }
-
-  uint64_t get_sampled_cache_tag(uint64_t full_addr) const
-  {
-    full_addr >>= LOG2_SETS + LOG2_BLOCK_SIZE + LOG2_SAMPLED_CACHE_SETS;
-    full_addr = (full_addr << (ADDR_BITS - SAMPLED_CACHE_TAG_BITS)) >> (ADDR_BITS - SAMPLED_CACHE_TAG_BITS);
-    return full_addr;
-  }
-
-  std::optional<uint32_t> search_sampled_cache(uint64_t blockAddress, uint32_t set) const
-  {
-    auto sampler_set = sampled_cache.at(set);
-    auto it =
-        std::find_if(sampler_set.cbegin(), sampler_set.cend(), [&](const SampledCacheLine& entry) { return (entry.valid && entry.tag == blockAddress); });
-    if (it != sampler_set.end())
-      return std::distance(sampler_set.cbegin(), it);
-    return {};
-  }
-
-  void detrain(uint32_t set, uint32_t way)
-  {
-    SampledCacheLine& temp = sampled_cache[set][way];
-    if (!temp.valid)
-      return;
-    temp.valid = false;
-
-    auto [rdp_it, inserted] = rdp.emplace(temp.signature, INF_RD);
-    if (!inserted)
-      rdp_it->second = min(rdp_it->second + 1, INF_RD);
-  }
-
   uint32_t temporal_difference(uint32_t init, uint32_t sample)
   {
     if (sample > init) {
@@ -175,19 +236,13 @@ class MJData
 
 public:
   MJData(uint32_t num_set, uint32_t num_way)
-      : NUM_SET{num_set}, NUM_WAY{num_way}, LOG2_SETS{lg2(num_set)}, LOG2_SIZE{LOG2_SETS + lg2(num_way) + LOG2_BLOCK_SIZE},
-        LOG2_SAMPLED_SETS{LOG2_SIZE - 16}, INF_RD{NUM_WAY * HISTORY - 1}, MAX_RD{INF_RD - 22}, INF_ETR{static_cast<int32_t>((NUM_WAY * HISTORY / GRANULARITY) - 1)},
-        SAMPLED_CACHE_TAG_BITS{31 - LOG2_SIZE}, PC_SIGNATURE_BITS{LOG2_SIZE - 10}, etr(NUM_SET), etr_clock(NUM_SET), current_timestamp(NUM_SET)
+      : NUM_SET{num_set}, NUM_WAY{num_way}, LOG2_SIZE{lg2(num_set) + lg2(num_way) + LOG2_BLOCK_SIZE}, INF_RD{NUM_WAY * HISTORY - 1}, MAX_RD{INF_RD - 22},
+        INF_ETR{static_cast<int32_t>((NUM_WAY * HISTORY / GRANULARITY) - 1)}, PC_SIGNATURE_BITS{LOG2_SIZE - 10}, etr(NUM_SET), etr_clock(NUM_SET),
+        sampler(num_set, num_way)
   {
-    uint32_t modifier = 1 << LOG2_SETS;
-    uint32_t limit = 1 << LOG2_SAMPLED_CACHE_SETS;
-
     for (uint32_t set = 0; set < NUM_SET; ++set) {
       etr[set].resize(NUM_WAY);
       etr_clock[set] = GRANULARITY;
-      if (is_sampled_set(set))
-        for (uint32_t i = 0; i < limit; i++)
-          sampled_cache.emplace(set + modifier * i, SAMPLED_CACHE_WAYS);
     }
   }
 
@@ -222,58 +277,27 @@ public:
 
     pc = get_pc_signature(pc, hit, type == PREFETCH, cpu);
 
-    if (is_sampled_set(set)) {
-      uint32_t sampled_cache_index = get_sampled_cache_index(full_addr);
-      uint64_t sampled_cache_tag = get_sampled_cache_tag(full_addr);
-      std::optional<uint32_t> sampled_cache_way = search_sampled_cache(sampled_cache_tag, sampled_cache_index);
+    if (sampler.is_sampled(set)) {
+      std::optional<std::pair<uint64_t, uint32_t>> sample = sampler.get_sample(set, full_addr);
+      if (sample) {
+        auto [signature, distance] = sample.value();
+        if (type == PREFETCH)
+          distance *= FLEXMIN_PENALTY;
 
-      auto& sampler_set = sampled_cache[sampled_cache_index];
-      if (sampled_cache_way) {
-        SampledCacheLine& sampler_entry = sampler_set[sampled_cache_way.value()];
-        uint32_t sample = current_timestamp[set] - sampler_entry.timestamp;
-
-        if (sample <= INF_RD) {
-          if (type == PREFETCH)
-            sample *= FLEXMIN_PENALTY;
-
-          // Either create a new rdp entry for the sample or
-          //   get an iterator to the existing one and update it with the sample
-          auto [rdp_it, inserted] = rdp.emplace(sampler_entry.signature, sample);
-          if (!inserted)
-            rdp_it->second = temporal_difference(rdp_it->second, sample);
-
-          sampler_entry.valid = false;
-        }
+        // Either create a new rdp entry for the sample or
+        //   get an iterator to the existing one and update it with the sample
+        auto [rdp_it, inserted] = rdp.emplace(signature, distance);
+        if (!inserted)
+          rdp_it->second = temporal_difference(rdp_it->second, distance);
       }
 
-      int32_t lru_way = -1;
-      uint32_t lru_rd = 0;
-      for (int32_t w = 0; w < SAMPLED_CACHE_WAYS; ++w) {
-        if (!sampler_set[w].valid) {
-          lru_way = w;
-          lru_rd = INF_RD + 1;
-          continue;
-        }
+      std::vector<uint64_t> expired_samples = sampler.add_sample(set, full_addr, pc);
 
-        uint32_t sample = current_timestamp[set] - sampler_set[w].timestamp;
-        if (sample > INF_RD) {
-          lru_way = w;
-          lru_rd = INF_RD + 1;
-          detrain(sampled_cache_index, w);
-        } else if (lru_way < 0 || sample > lru_rd) {
-          lru_way = w;
-          lru_rd = sample;
-        }
+      for (uint64_t signature : expired_samples) {
+        auto [rdp_it, inserted] = rdp.emplace(signature, INF_RD);
+        if (!inserted)
+          rdp_it->second = min(rdp_it->second + 1, INF_RD);
       }
-      detrain(sampled_cache_index, lru_way);
-
-      for (auto& entry : sampler_set) {
-        if (!entry.valid) {
-          entry.reinit(pc, sampled_cache_tag, current_timestamp[set]);
-          break;
-        }
-      }
-      ++current_timestamp[set];
     }
 
     if (etr_clock[set] == GRANULARITY) {
