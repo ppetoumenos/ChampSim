@@ -10,13 +10,15 @@
 #include "cache.h"
 #include "ooo_cpu.h"
 
+constexpr uint32_t ADDR_BITS = 64;
+
 constexpr uint32_t HISTORY = 8;
 constexpr uint32_t GRANULARITY = 8;
 constexpr uint32_t SAMPLED_CACHE_WAYS = 5;
 constexpr uint32_t LOG2_SAMPLED_CACHE_SETS = 4;
 constexpr uint32_t TIMESTAMP_BITS = 8;
 
-constexpr double TEMP_DIFFERENCE = 1.0 / 16.0;
+constexpr uint32_t TEMPDIFF_SCALING = 16;
 constexpr double FLEXMIN_PENALTY = 2.0 - lg2(NUM_CPUS) / 4.0;
 
 uint64_t CRC_HASH(uint64_t _blockAddress)
@@ -35,10 +37,6 @@ class Counter
   uint32_t num{0};
 
 public:
-  Counter() = default;
-
-  Counter(const Counter& other) { num = other.num; }
-
   Counter& operator++()
   {
     num = (num + 1) & bitmask(bits);
@@ -58,9 +56,9 @@ using Timestamp = Counter<TIMESTAMP_BITS>;
 
 struct SampledCacheLine {
   bool valid{false};
-  uint64_t tag;
-  uint64_t signature;
-  Timestamp timestamp;
+  uint64_t tag{0};
+  uint64_t signature{0};
+  Timestamp timestamp{};
 
   void reinit(uint64_t pc, uint64_t tag, Timestamp curr)
   {
@@ -76,7 +74,8 @@ class MJData
   const uint32_t NUM_SET, NUM_WAY;
   const uint32_t LOG2_SETS, LOG2_SIZE, LOG2_SAMPLED_SETS;
 
-  const uint32_t INF_RD, INF_ETR, MAX_RD;
+  const uint32_t INF_RD, MAX_RD;
+  const int32_t INF_ETR;
   const uint32_t SAMPLED_CACHE_TAG_BITS, PC_SIGNATURE_BITS;
 
   std::vector<std::vector<int32_t>> etr;
@@ -86,14 +85,14 @@ class MJData
   std::unordered_map<uint32_t, uint32_t> rdp;
   std::unordered_map<uint32_t, std::vector<SampledCacheLine>> sampled_cache;
 
-  bool is_sampled_set(uint32_t set)
+  bool is_sampled_set(uint32_t set) const
   {
     uint32_t mask_length = LOG2_SETS - LOG2_SAMPLED_SETS;
     uint32_t mask = bitmask(mask_length);
     return (set & mask) == ((set >> (LOG2_SETS - mask_length)) & mask);
   }
 
-  uint64_t get_pc_signature(uint64_t pc, bool hit, bool prefetch, uint32_t core)
+  uint64_t get_pc_signature(uint64_t pc, bool hit, bool prefetch, uint32_t core) const
   {
     if (NUM_CPUS == 1) {
       pc = pc << 1;
@@ -105,7 +104,7 @@ class MJData
         pc = pc | 1;
       }
       pc = CRC_HASH(pc);
-      pc = (pc << (64 - PC_SIGNATURE_BITS)) >> (64 - PC_SIGNATURE_BITS);
+      pc = (pc << (ADDR_BITS - PC_SIGNATURE_BITS)) >> (ADDR_BITS - PC_SIGNATURE_BITS);
     } else {
       pc = pc << 1;
       if (prefetch) {
@@ -114,31 +113,32 @@ class MJData
       pc = pc << 2;
       pc = pc | core;
       pc = CRC_HASH(pc);
-      pc = (pc << (64 - PC_SIGNATURE_BITS)) >> (64 - PC_SIGNATURE_BITS);
+      pc = (pc << (ADDR_BITS - PC_SIGNATURE_BITS)) >> (ADDR_BITS - PC_SIGNATURE_BITS);
     }
     return pc;
   }
 
-  uint32_t get_sampled_cache_index(uint64_t full_addr)
+  uint32_t get_sampled_cache_index(uint64_t full_addr) const
   {
     full_addr = full_addr >> LOG2_BLOCK_SIZE;
-    full_addr = (full_addr << (64 - (LOG2_SAMPLED_CACHE_SETS + LOG2_SETS))) >> (64 - (LOG2_SAMPLED_CACHE_SETS + LOG2_SETS));
+    full_addr = (full_addr << (ADDR_BITS - (LOG2_SAMPLED_CACHE_SETS + LOG2_SETS))) >> (ADDR_BITS - (LOG2_SAMPLED_CACHE_SETS + LOG2_SETS));
     return full_addr;
   }
 
-  uint64_t get_sampled_cache_tag(uint64_t x)
+  uint64_t get_sampled_cache_tag(uint64_t x) const
   {
     x >>= LOG2_SETS + LOG2_BLOCK_SIZE + LOG2_SAMPLED_CACHE_SETS;
-    x = (x << (64 - SAMPLED_CACHE_TAG_BITS)) >> (64 - SAMPLED_CACHE_TAG_BITS);
+    x = (x << (ADDR_BITS - SAMPLED_CACHE_TAG_BITS)) >> (ADDR_BITS - SAMPLED_CACHE_TAG_BITS);
     return x;
   }
 
-  std::optional<uint32_t> search_sampled_cache(uint64_t blockAddress, uint32_t set)
+  std::optional<uint32_t> search_sampled_cache(uint64_t blockAddress, uint32_t set) const
   {
+    auto sampler_set = sampled_cache.at(set);
     auto it =
-        std::find_if(sampled_cache[set].begin(), sampled_cache[set].end(), [&](SampledCacheLine& entry) { return (entry.valid && entry.tag == blockAddress); });
-    if (it != sampled_cache[set].end())
-      return std::distance(sampled_cache[set].begin(), it);
+        std::find_if(sampler_set.cbegin(), sampler_set.cend(), [&](const SampledCacheLine& entry) { return (entry.valid && entry.tag == blockAddress); });
+    if (it != sampler_set.end())
+      return std::distance(sampler_set.cbegin(), it);
     return {};
   }
 
@@ -158,15 +158,15 @@ class MJData
   {
     if (sample > init) {
       uint32_t diff = sample - init;
-      diff = diff * TEMP_DIFFERENCE;
-      diff = min(1u, diff);
+      diff /= TEMPDIFF_SCALING;
+      diff = min(1U, diff);
       return min(init + diff, INF_RD);
     }
 
     if (sample < init) {
       uint32_t diff = init - sample;
-      diff = diff * TEMP_DIFFERENCE;
-      diff = min(1u, diff);
+      diff /= TEMPDIFF_SCALING;
+      diff = min(1U, diff);
       return init - diff;
     }
 
@@ -176,7 +176,7 @@ class MJData
 public:
   MJData(uint32_t num_set, uint32_t num_way)
       : NUM_SET{num_set}, NUM_WAY{num_way}, LOG2_SETS{lg2(num_set)}, LOG2_SIZE{LOG2_SETS + lg2(num_way) + LOG2_BLOCK_SIZE},
-        LOG2_SAMPLED_SETS{LOG2_SIZE - 16}, INF_RD{NUM_WAY * HISTORY - 1}, INF_ETR{(NUM_WAY * HISTORY / GRANULARITY) - 1}, MAX_RD{INF_RD - 22},
+        LOG2_SAMPLED_SETS{LOG2_SIZE - 16}, INF_RD{NUM_WAY * HISTORY - 1}, MAX_RD{INF_RD - 22}, INF_ETR{static_cast<int32_t>((NUM_WAY * HISTORY / GRANULARITY) - 1)},
         SAMPLED_CACHE_TAG_BITS{31 - LOG2_SIZE}, PC_SIGNATURE_BITS{LOG2_SIZE - 10}, etr(NUM_SET), etr_clock(NUM_SET), current_timestamp(NUM_SET)
   {
     uint32_t modifier = 1 << LOG2_SETS;
@@ -215,7 +215,7 @@ public:
   void update_replacement_state(uint32_t cpu, uint32_t set, uint32_t way, uint64_t full_addr, uint64_t pc, uint64_t victim_addr, uint32_t type, uint8_t hit)
   {
     if (type == WRITEBACK) {
-      if (!hit)
+      if (hit)
         etr[set][way] = -INF_ETR;
       return;
     }
@@ -246,9 +246,9 @@ public:
         }
       }
 
-      int lru_way = -1;
-      int lru_rd = -1;
-      for (uint32_t w = 0; w < SAMPLED_CACHE_WAYS; ++w) {
+      int32_t lru_way = -1;
+      uint32_t lru_rd = 0;
+      for (int32_t w = 0; w < SAMPLED_CACHE_WAYS; ++w) {
         if (!sampler_set[w].valid) {
           lru_way = w;
           lru_rd = INF_RD + 1;
@@ -260,7 +260,7 @@ public:
           lru_way = w;
           lru_rd = INF_RD + 1;
           detrain(sampled_cache_index, w);
-        } else if (lru_rd < 0 || sample > uint32_t(lru_rd)) {
+        } else if (lru_way < 0 || sample > lru_rd) {
           lru_way = w;
           lru_rd = sample;
         }
@@ -292,7 +292,7 @@ public:
     if (!rdp.count(pc))
       etr[set][way] = (NUM_CPUS == 1) ? 0 : INF_ETR;
     else
-      etr[set][way] = (rdp[pc] > MAX_RD) ? INF_ETR : rdp[pc] / GRANULARITY;
+      etr[set][way] = (rdp[pc] > MAX_RD) ? INF_ETR : static_cast<int32_t>(rdp[pc] / GRANULARITY);
   }
 };
 
