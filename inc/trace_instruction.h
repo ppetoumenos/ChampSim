@@ -24,7 +24,7 @@ constexpr std::size_t NUM_INSTR_DESTINATIONS_SPARC = 4;
 constexpr std::size_t NUM_INSTR_DESTINATIONS = 2;
 constexpr std::size_t NUM_INSTR_SOURCES = 4;
 
-class LSQ_ENTRY;
+struct LSQ_ENTRY;
 
 struct input_instr {
   // instruction pointer or PC (Program Counter)
