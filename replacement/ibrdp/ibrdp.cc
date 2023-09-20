@@ -11,9 +11,9 @@
 #include <optional>
 #include <vector>
 
-#include "../../inc/cache.h"
-#include "../../inc/ooo_cpu.h"
-#include "../../inc/util.h"
+#include "cache.h"
+#include "msl/bits.h"
+#include "ooo_cpu.h"
 
 // MAX and SAFE values for the IbRDPredictor confidence counters
 constexpr uint32_t MAX_CONFIDENCE = 3;
@@ -54,11 +54,11 @@ constexpr uint32_t IBRDP_WAYS = 16;
 // not alligned on word boundaries, because we believe that the possibility of
 // two different memory instrunction starting in the same memory word is too
 // low to worth a couple of extra bits.
-static inline uint32_t TransformPC(uint64_t pc) { return static_cast<uint32_t>((pc >> 2) & bitmask(BITS_PC)); }
+static inline uint32_t TransformPC(uint64_t pc) { return static_cast<uint32_t>((pc >> 2) & champsim::msl::bitmask(BITS_PC)); }
 
 // returns bits 25:0 of address (bits 31:6 of the real address,
 // the argument address has already been stripped of the byte offset bits)
-static inline uint32_t TransformAddress(uint64_t address) { return static_cast<uint32_t>((address >> LOG2_BLOCK_SIZE) & bitmask(BITS_ADDR)); }
+static inline uint32_t TransformAddress(uint64_t address) { return static_cast<uint32_t>((address >> LOG2_BLOCK_SIZE) & champsim::msl::bitmask(BITS_ADDR)); }
 
 // The rest of the helper functions are self-explanatory
 static inline uint32_t QuantizeTimestamp(uint32_t timestamp) { return (timestamp / QUANTUM_TIMESTAMP) & MAX_VALUE_TIMESTAMP; }
@@ -147,7 +147,7 @@ private:
   }
 
 public:
-  IBRDPredictor(uint32_t num_sets, uint32_t num_ways) : predictor(num_sets), num_ways{num_ways}, set_mask{num_sets - 1}, set_shift{lg2(num_sets)}
+  IBRDPredictor(uint32_t num_sets, uint32_t num_ways) : predictor(num_sets), num_ways{num_ways}, set_mask{num_sets - 1}, set_shift{champsim::msl::lg2(num_sets)}
   {
     for (uint32_t set = 0; set < num_sets; ++set) {
       predictor[set].resize(num_ways);
@@ -308,7 +308,7 @@ struct IBRDP_Policy {
   std::vector<std::vector<ReplState>> repl;
 
   IBRDP_Policy(uint32_t num_set, uint32_t num_way)
-      : predictor(IBRDP_SETS, IBRDP_WAYS), sampler(SAMPLER_PERIOD, SAMPLER_MAX_RD, predictor), set_shift{lg2(num_set)}, repl(num_set)
+      : predictor(IBRDP_SETS, IBRDP_WAYS), sampler(SAMPLER_PERIOD, SAMPLER_MAX_RD, predictor), set_shift{champsim::msl::lg2(num_set)}, repl(num_set)
   {
     for (auto& entry : repl)
       entry.resize(num_way);
@@ -319,7 +319,7 @@ std::unordered_map<CACHE*, IBRDP_Policy> ibrdp;
 
 void CACHE::initialize_replacement() { ibrdp.try_emplace(this, NUM_SET, NUM_WAY); }
 
-uint32_t CACHE::find_victim(uint32_t cpu, uint64_t instr_id, uint32_t set, const BLOCK* current_set, uint64_t pc, uint64_t full_addr, uint32_t type)
+uint32_t CACHE::find_victim(uint32_t triggering_cpu, uint64_t instr_id, uint32_t set, const BLOCK* current_set, uint64_t ip, uint64_t full_addr, uint32_t type)
 {
   auto& policy = ibrdp.at(this);
 
@@ -328,8 +328,8 @@ uint32_t CACHE::find_victim(uint32_t cpu, uint64_t instr_id, uint32_t set, const
   uint32_t new_prediction = 0;
 
 #if defined(SELECTIVE_CACHING)
-  if (type != WRITEBACK)
-    new_prediction = policy.predictor.Lookup(TransformPC(pc));
+  if (access_type{type} != access_type::WRITE)
+    new_prediction = policy.predictor.Lookup(TransformPC(ip));
 #endif
 
   uint32_t now = 0;         // Current time
@@ -390,28 +390,28 @@ uint32_t CACHE::find_victim(uint32_t cpu, uint64_t instr_id, uint32_t set, const
     // If the reuse-distance prediction for the new line is greater than
     // the victim_time, then the new line is less likely to fit in the
     // cache than the selected victim, so we choose to bypass the cache
-    if ((UnQuantizePrediction(new_prediction) > victim_time) && (type != WRITEBACK))
+    if ((UnQuantizePrediction(new_prediction) > victim_time) && (access_type{type} != access_type::WRITE))
       victim_way = NUM_WAY;
   }
 
   // This can happen if time_idle and time_left are zero for all entries in the set.
   // It is unlikely but it does happen
-  if ((type == WRITEBACK) && (victim_way == NUM_WAY))
+  if ((access_type{type} == access_type::WRITE) && (victim_way == NUM_WAY))
     victim_way = 0;
 
   return victim_way;
 }
 
 /* called on every cache hit and cache fill */
-void CACHE::update_replacement_state(uint32_t cpu, uint32_t set, uint32_t way, uint64_t full_addr, uint64_t pc, uint64_t victim_addr, uint32_t type,
+void CACHE::update_replacement_state(uint32_t triggering_cpu, uint32_t set, uint32_t way, uint64_t full_addr, uint64_t ip, uint64_t victim_addr, uint32_t type,
                                      uint8_t hit)
 {
   uint32_t prediction = 0;
-  uint32_t myPC = TransformPC(pc);
+  uint32_t myPC = TransformPC(ip);
   uint32_t myAddress = TransformAddress(full_addr);
 
   auto& policy = ibrdp.at(this);
-  if (type == LOAD) {
+  if (access_type{type} == access_type::LOAD) {
     policy.accessesCounterLow++;
     if (policy.accessesCounterLow == QUANTUM_TIMESTAMP) {
       policy.accessesCounterLow = 0;
@@ -425,11 +425,11 @@ void CACHE::update_replacement_state(uint32_t cpu, uint32_t set, uint32_t way, u
   if (way == NUM_WAY)
     return;
 
-  if (hit && type == WRITEBACK)
+  if (hit && access_type{type} == access_type::WRITE)
     return;
 
   // Get the prediction information for the accessed line
-  if (type == LOAD)
+  if (access_type{type} == access_type::LOAD)
     prediction = policy.predictor.Lookup(myPC);
 
   // Fill the accessed line with the replacement policy information
@@ -439,7 +439,7 @@ void CACHE::update_replacement_state(uint32_t cpu, uint32_t set, uint32_t way, u
   // For Writebacks, we give dummy values to both fields
   //    so that the line will be almost certainly replaced upon
   //    the next miss
-  if (type != WRITEBACK) {
+  if (access_type{type} != access_type::WRITE) {
     policy.repl[set][way].timestamp = policy.accessesCounterHigh;
     policy.repl[set][way].prediction = prediction;
   } else {

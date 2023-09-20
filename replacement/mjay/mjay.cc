@@ -6,8 +6,9 @@
 #include <optional>
 #include <vector>
 
-#include "../../inc/cache.h"
-#include "../../inc/ooo_cpu.h"
+#include "cache.h"
+#include "ooo_cpu.h"
+#include "msl/bits.h"
 #include <unordered_map>
 
 constexpr uint32_t ADDR_BITS = 64;
@@ -19,7 +20,7 @@ constexpr uint32_t LOG2_SAMPLED_CACHE_SETS = 4;
 constexpr uint32_t TIMESTAMP_BITS = 8;
 
 constexpr uint32_t TEMPDIFF_SCALING = 16;
-constexpr double FLEXMIN_PENALTY = 2.0 - lg2(NUM_CPUS) / 4.0;
+constexpr double FLEXMIN_PENALTY = 2.0 - champsim::msl::lg2(NUM_CPUS) / 4.0;
 
 uint64_t CRC_HASH(uint64_t _blockAddress)
 {
@@ -39,7 +40,7 @@ class Counter
 public:
   Counter& operator++()
   {
-    num = (num + 1) & bitmask(bits);
+    num = (num + 1) & champsim::msl::bitmask(bits);
     return *this;
   }
 
@@ -94,7 +95,7 @@ class Sampler
 
 public:
   Sampler(uint32_t num_cache_set, uint32_t num_cache_way)
-      : LOG2_SETS{lg2(num_cache_set)}, LOG2_SIZE{LOG2_SETS + lg2(num_cache_way) + LOG2_BLOCK_SIZE}, LOG2_SAMPLED_SETS{LOG2_SIZE - 16},
+      : LOG2_SETS{champsim::msl::lg2(num_cache_set)}, LOG2_SIZE{LOG2_SETS + champsim::msl::lg2(num_cache_way) + LOG2_BLOCK_SIZE}, LOG2_SAMPLED_SETS{LOG2_SIZE - 16},
         SAMPLED_CACHE_TAG_BITS{31 - LOG2_SIZE}, INF_RD{num_cache_way * HISTORY - 1}, current_timestamp(num_cache_set)
   {
     uint32_t modifier = 1 << LOG2_SETS;
@@ -109,7 +110,7 @@ public:
   bool is_sampled(uint32_t cache_set) const
   {
     uint32_t mask_length = LOG2_SETS - LOG2_SAMPLED_SETS;
-    uint32_t mask = bitmask(mask_length);
+    uint32_t mask = champsim::msl::bitmask(mask_length);
     return (cache_set & mask) == ((cache_set >> (LOG2_SETS - mask_length)) & mask);
   }
 
@@ -220,14 +221,14 @@ class MJData
     if (sample > init) {
       uint32_t diff = sample - init;
       diff /= TEMPDIFF_SCALING;
-      diff = min(1U, diff);
-      return min(init + diff, INF_RD);
+      diff = std::min(1U, diff);
+      return std::min(init + diff, INF_RD);
     }
 
     if (sample < init) {
       uint32_t diff = init - sample;
       diff /= TEMPDIFF_SCALING;
-      diff = min(1U, diff);
+      diff = std::min(1U, diff);
       return init - diff;
     }
 
@@ -236,7 +237,7 @@ class MJData
 
 public:
   MJData(uint32_t num_set, uint32_t num_way)
-      : NUM_SET{num_set}, NUM_WAY{num_way}, LOG2_SIZE{lg2(num_set) + lg2(num_way) + LOG2_BLOCK_SIZE}, INF_RD{NUM_WAY * HISTORY - 1}, MAX_RD{INF_RD - 22},
+      : NUM_SET{num_set}, NUM_WAY{num_way}, LOG2_SIZE{champsim::msl::lg2(num_set) + champsim::msl::lg2(num_way) + LOG2_BLOCK_SIZE}, INF_RD{NUM_WAY * HISTORY - 1}, MAX_RD{INF_RD - 22},
         INF_ETR{static_cast<int32_t>((NUM_WAY * HISTORY / GRANULARITY) - 1)}, PC_SIGNATURE_BITS{LOG2_SIZE - 10}, etr(NUM_SET), etr_clock(NUM_SET),
         sampler(num_set, num_way)
   {
@@ -257,10 +258,10 @@ public:
       max_etr = abs(etr[set][victim_way]);
     }
 
-    if (type == WRITEBACK)
+    if (access_type{type} == access_type::WRITE)
       return victim_way;
 
-    auto rdp_it = rdp.find(get_pc_signature(pc, false, type == PREFETCH, cpu));
+    auto rdp_it = rdp.find(get_pc_signature(pc, false, access_type{type} == access_type::PREFETCH, cpu));
     if (rdp_it != rdp.end() && (rdp_it->second > MAX_RD || rdp_it->second / GRANULARITY > max_etr))
       return NUM_WAY;
 
@@ -269,19 +270,19 @@ public:
 
   void update_replacement_state(uint32_t cpu, uint32_t set, uint32_t way, uint64_t full_addr, uint64_t pc, uint64_t victim_addr, uint32_t type, uint8_t hit)
   {
-    if (type == WRITEBACK) {
+    if (access_type{type} == access_type::WRITE) {
       if (!hit)
         etr[set][way] = -INF_ETR;
       return;
     }
 
-    pc = get_pc_signature(pc, hit, type == PREFETCH, cpu);
+    pc = get_pc_signature(pc, hit, access_type{type} == access_type::PREFETCH, cpu);
 
     if (sampler.is_sampled(set)) {
       std::optional<std::pair<uint64_t, uint32_t>> sample = sampler.get_sample(set, full_addr);
       if (sample) {
         auto [signature, distance] = sample.value();
-        if (type == PREFETCH)
+        if (access_type{type} == access_type::PREFETCH)
           distance *= FLEXMIN_PENALTY;
 
         // Either create a new rdp entry for the sample or
@@ -296,7 +297,7 @@ public:
       for (uint64_t signature : expired_samples) {
         auto [rdp_it, inserted] = rdp.emplace(signature, INF_RD);
         if (!inserted)
-          rdp_it->second = min(rdp_it->second + 1, INF_RD);
+          rdp_it->second = std::min(rdp_it->second + 1, INF_RD);
       }
     }
 

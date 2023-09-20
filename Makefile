@@ -1,87 +1,71 @@
-CC := gcc
-CXX := g++
-CFLAGS := -Wall -O3 -std=gnu99
-CXXFLAGS := -Wall -O3 -std=c++17
-CPPFLAGS :=  -Iinc -MMD -MP
-LDFLAGS := 
-LDLIBS := 
+ROOT_DIR = $(patsubst %/,%,$(dir $(abspath $(firstword $(MAKEFILE_LIST)))))
 
-.phony: all clean
+CPPFLAGS += -MMD -I$(ROOT_DIR)/inc
+CXXFLAGS += --std=c++17 -O3 -Wall -Wextra -Wshadow -Wpedantic
 
-all: bin/champsim
+# vcpkg integration
+TRIPLET_DIR = $(patsubst %/,%,$(firstword $(filter-out $(ROOT_DIR)/vcpkg_installed/vcpkg/, $(wildcard $(ROOT_DIR)/vcpkg_installed/*/))))
+CPPFLAGS += -isystem $(TRIPLET_DIR)/include
+LDFLAGS  += -L$(TRIPLET_DIR)/lib -L$(TRIPLET_DIR)/lib/manual-link
+LDLIBS   += -llzma -lz -lbz2 -lfmt
 
-clean: 
-	$(RM) inc/champsim_constants.h
-	$(RM) src/core_inst.cc
-	$(RM) inc/cache_modules.inc
-	$(RM) inc/ooo_cpu_modules.inc
-	 find . -name \*.o -delete
-	 find . -name \*.d -delete
-	 $(RM) -r obj
+.phony: all all_execs clean configclean test makedirs
 
-	 find replacement/ibrdp -name \*.o -delete
-	 find replacement/ibrdp -name \*.d -delete
-	 find prefetcher/no -name \*.o -delete
-	 find prefetcher/no -name \*.d -delete
-	 find replacement/lru -name \*.o -delete
-	 find replacement/lru -name \*.d -delete
-	 find prefetcher/no_instr -name \*.o -delete
-	 find prefetcher/no_instr -name \*.d -delete
-	 find branch/bimodal -name \*.o -delete
-	 find branch/bimodal -name \*.d -delete
-	 find btb/basic_btb -name \*.o -delete
-	 find btb/basic_btb -name \*.d -delete
+test_main_name=$(ROOT_DIR)/test/bin/000-test-main
 
-bin/champsim: $(patsubst %.cc,%.o,$(wildcard src/*.cc)) obj/repl_rreplacementDibrdp.a obj/pref_pprefetcherDno.a obj/repl_rreplacementDlru.a obj/pref_pprefetcherDno_instr.a obj/bpred_bbranchDbimodal.a obj/btb_bbtbDbasic_btb.a
-	$(CXX) $(LDFLAGS) -o $@ $^ $(LDLIBS)
+all: all_execs
 
-replacement/ibrdp/%.o: CFLAGS += -Ireplacement/ibrdp
-replacement/ibrdp/%.o: CXXFLAGS += -Ireplacement/ibrdp
-replacement/ibrdp/%.o: CXXFLAGS +=  -Dinitialize_replacement=repl_rreplacementDibrdp_initialize -Dfind_victim=repl_rreplacementDibrdp_victim -Dupdate_replacement_state=repl_rreplacementDibrdp_update -Dreplacement_final_stats=repl_rreplacementDibrdp_final_stats
-obj/repl_rreplacementDibrdp.a: $(patsubst %.cc,%.o,$(wildcard replacement/ibrdp/*.cc)) $(patsubst %.c,%.o,$(wildcard replacement/ibrdp/*.c))
-	@mkdir -p $(dir $@)
-	ar -rcs $@ $^
+# Generated configuration makefile contains:
+#  - $(executable_name), the list of all executables in the configuration
+#  - $(build_dirs), the list of all directories that hold executables
+#  - $(build_objs), the list of all object files corresponding to core sources
+#  - $(module_dirs), the list of all directories that hold module object files
+#  - $(module_objs), the list of all object files corresponding to modules
+#  - All dependencies and flags assigned according to the modules
+include _configuration.mk
 
-prefetcher/no/%.o: CFLAGS += -Iprefetcher/no
-prefetcher/no/%.o: CXXFLAGS += -Iprefetcher/no
-prefetcher/no/%.o: CXXFLAGS +=  -Dprefetcher_initialize=pref_pprefetcherDno_initialize -Dprefetcher_cache_operate=pref_pprefetcherDno_cache_operate -Dprefetcher_cache_fill=pref_pprefetcherDno_cache_fill -Dprefetcher_cycle_operate=pref_pprefetcherDno_cycle_operate -Dprefetcher_final_stats=pref_pprefetcherDno_final_stats -Dl1d_prefetcher_initialize=pref_pprefetcherDno_initialize -Dl2c_prefetcher_initialize=pref_pprefetcherDno_initialize -Dllc_prefetcher_initialize=pref_pprefetcherDno_initialize -Dl1d_prefetcher_operate=pref_pprefetcherDno_cache_operate -Dl2c_prefetcher_operate=pref_pprefetcherDno_cache_operate -Dllc_prefetcher_operate=pref_pprefetcherDno_cache_operate -Dl1d_prefetcher_cache_fill=pref_pprefetcherDno_cache_fill -Dl2c_prefetcher_cache_fill=pref_pprefetcherDno_cache_fill -Dllc_prefetcher_cache_fill=pref_pprefetcherDno_cache_fill -Dl1d_prefetcher_final_stats=pref_pprefetcherDno_final_stats -Dl2c_prefetcher_final_stats=pref_pprefetcherDno_final_stats -Dllc_prefetcher_final_stats=pref_pprefetcherDno_final_stats
-obj/pref_pprefetcherDno.a: $(patsubst %.cc,%.o,$(wildcard prefetcher/no/*.cc)) $(patsubst %.c,%.o,$(wildcard prefetcher/no/*.c))
-	@mkdir -p $(dir $@)
-	ar -rcs $@ $^
+all_execs: $(filter-out $(test_main_name), $(executable_name))
 
-replacement/lru/%.o: CFLAGS += -Ireplacement/lru
-replacement/lru/%.o: CXXFLAGS += -Ireplacement/lru
-replacement/lru/%.o: CXXFLAGS +=  -Dinitialize_replacement=repl_rreplacementDlru_initialize -Dfind_victim=repl_rreplacementDlru_victim -Dupdate_replacement_state=repl_rreplacementDlru_update -Dreplacement_final_stats=repl_rreplacementDlru_final_stats
-obj/repl_rreplacementDlru.a: $(patsubst %.cc,%.o,$(wildcard replacement/lru/*.cc)) $(patsubst %.c,%.o,$(wildcard replacement/lru/*.c))
-	@mkdir -p $(dir $@)
-	ar -rcs $@ $^
+# Remove all intermediate files
+clean:
+	@-find src test .csconfig $(module_dirs) \( -name '*.o' -o -name '*.d' \) -delete &> /dev/null
+	@-$(RM) inc/champsim_constants.h
+	@-$(RM) inc/cache_modules.h
+	@-$(RM) inc/ooo_cpu_modules.h
+	@-$(RM) src/core_inst.cc
+	@-$(RM) $(test_main_name)
 
-prefetcher/no_instr/%.o: CFLAGS += -Iprefetcher/no_instr
-prefetcher/no_instr/%.o: CXXFLAGS += -Iprefetcher/no_instr
-prefetcher/no_instr/%.o: CXXFLAGS +=  -Dprefetcher_initialize=pref_pprefetcherDno_instr_initialize -Dprefetcher_branch_operate=pref_pprefetcherDno_instr_branch_operate -Dprefetcher_cache_operate=pref_pprefetcherDno_instr_cache_operate -Dprefetcher_cycle_operate=pref_pprefetcherDno_instr_cycle_operate -Dprefetcher_cache_fill=pref_pprefetcherDno_instr_cache_fill -Dprefetcher_final_stats=pref_pprefetcherDno_instr_final_stats -Dl1i_prefetcher_initialize=pref_pprefetcherDno_instr_initialize -Dl1i_prefetcher_branch_operate=pref_pprefetcherDno_instr_branch_operate -Dl1i_prefetcher_cache_operate=pref_pprefetcherDno_instr_cache_operate -Dl1i_prefetcher_cycle_operate=pref_pprefetcherDno_instr_cycle_operate -Dl1i_prefetcher_cache_fill=pref_pprefetcherDno_instr_cache_fill -Dl1i_prefetcher_final_stats=pref_pprefetcherDno_instr_final_stats
-obj/pref_pprefetcherDno_instr.a: $(patsubst %.cc,%.o,$(wildcard prefetcher/no_instr/*.cc)) $(patsubst %.c,%.o,$(wildcard prefetcher/no_instr/*.c))
-	@mkdir -p $(dir $@)
-	ar -rcs $@ $^
+# Remove all configuration files
+configclean: clean
+	@-$(RM) -r $(module_dirs) _configuration.mk
 
-branch/bimodal/%.o: CFLAGS += -Ibranch/bimodal
-branch/bimodal/%.o: CXXFLAGS += -Ibranch/bimodal
-branch/bimodal/%.o: CXXFLAGS +=  -Dinitialize_branch_predictor=bpred_bbranchDbimodal_initialize -Dlast_branch_result=bpred_bbranchDbimodal_last_result -Dpredict_branch=bpred_bbranchDbimodal_predict
-obj/bpred_bbranchDbimodal.a: $(patsubst %.cc,%.o,$(wildcard branch/bimodal/*.cc)) $(patsubst %.c,%.o,$(wildcard branch/bimodal/*.c))
-	@mkdir -p $(dir $@)
-	ar -rcs $@ $^
+# Make directories that don't exist
+# exclude "test" to not conflict with the phony target
+$(filter-out test, $(sort $(build_dirs) $(module_dirs))): | $(dir $@)
+	-mkdir $@
 
-btb/basic_btb/%.o: CFLAGS += -Ibtb/basic_btb
-btb/basic_btb/%.o: CXXFLAGS += -Ibtb/basic_btb
-btb/basic_btb/%.o: CXXFLAGS +=  -Dinitialize_btb=btb_bbtbDbasic_btb_initialize -Dupdate_btb=btb_bbtbDbasic_btb_update -Dbtb_prediction=btb_bbtbDbasic_btb_predict
-obj/btb_bbtbDbasic_btb.a: $(patsubst %.cc,%.o,$(wildcard btb/basic_btb/*.cc)) $(patsubst %.c,%.o,$(wildcard btb/basic_btb/*.c))
-	@mkdir -p $(dir $@)
-	ar -rcs $@ $^
+# All .o files should be made like .cc files
+$(build_objs) $(module_objs):
+	$(COMPILE.cc) $(OUTPUT_OPTION) $<
 
--include $(wildcard src/*.d)
--include $(wildcard replacement/ibrdp/*.d)
--include $(wildcard prefetcher/no/*.d)
--include $(wildcard replacement/lru/*.d)
--include $(wildcard prefetcher/no_instr/*.d)
--include $(wildcard branch/bimodal/*.d)
--include $(wildcard btb/basic_btb/*.d)
+# Add address sanitizers for tests
+#$(test_main_name): CXXFLAGS += -fsanitize=address -fno-omit-frame-pointer
+$(test_main_name): CXXFLAGS += -g3 -Og -Wconversion
+$(test_main_name): LDLIBS   += -lCatch2Main -lCatch2
 
+# Link test executable
+$(test_main_name):
+	$(LINK.cc) $(LDFLAGS) -o $@ $(filter-out %/main.o, $^) $(LOADLIBES) $(LDLIBS)
+
+# Link main executables
+$(filter-out $(test_main_name), $(executable_name)):
+	$(LINK.cc) $(LDFLAGS) -o $@ $^ $(LOADLIBES) $(LDLIBS)
+
+# Tests: build and run
+test: $(test_main_name)
+	$(test_main_name)
+
+pytest:
+	PYTHONPATH=$(PYTHONPATH):$(shell pwd) python3 -m unittest discover -v --start-directory='test/python'
+
+-include $(foreach dir,$(wildcard .csconfig/*/) $(wildcard .csconfig/test/*/),$(wildcard $(dir)/obj/*.d))
