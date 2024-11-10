@@ -407,6 +407,7 @@ void CACHE::update_replacement_state(uint32_t cpu, uint32_t set, uint32_t way, u
 
 /* called at the end of the simulation */
 void CACHE::replacement_final_stats() {
+#ifdef PRODUCE_RD_TRACE
   std::unordered_map<uint64_t, std::vector<traceData>::reverse_iterator> last_seen;
   for (auto it = trace.rbegin(); it != trace.rend(); ++it) {
     auto entry = last_seen.find(it->addr);
@@ -420,4 +421,5 @@ void CACHE::replacement_final_stats() {
   for (auto it = trace.begin(); it != trace.end(); ++it) {
     trace_file << it->ip << "\t" << it->addr << "\t" << it->past_rd << "\t" << it->past_rd_set << "\t" << it->future_rd << "\t" << it->future_rd_set << "\n";
   }
+#endif
 }
