@@ -31,8 +31,8 @@ constexpr double FLEXMIN_PENALTY = 2.0 - champsim::msl::lg2(NUM_CPUS) / 4.0;
 #ifdef PRODUCE_RD_TRACE
 struct SamplerEntry {
   uint64_t ip;
-  uint64_t timestamp;
-  uint64_t set_timestamp;
+  uint32_t timestamp;
+  uint32_t set_timestamp;
 };
 #endif
 
@@ -76,11 +76,11 @@ struct SampledCacheLine {
   uint64_t signature{0};
   Timestamp timestamp{};
 
-  void set(uint64_t pc, uint64_t tag, Timestamp curr)
+  void set(uint64_t pc, uint64_t _tag, Timestamp curr)
   {
     valid = true;
     signature = pc;
-    this->tag = tag;
+    this->tag = _tag;
     timestamp = curr;
   }
 };
@@ -262,7 +262,7 @@ public:
     }
   }
 
-  uint32_t find_victim(uint32_t cpu, uint32_t set, uint64_t pc, uint32_t type)
+  uint32_t find_victim(uint32_t triggering_cpu, uint32_t set, uint64_t pc, uint32_t type)
   {
     auto victim_it = std::min_element(etr[set].begin(), etr[set].end(),
                                       [](int32_t num1, int32_t num2) { return (abs(num1) > abs(num2) || (abs(num1) == abs(num2) && num1 < 0)); });
@@ -276,14 +276,14 @@ public:
     if (access_type{type} == access_type::WRITE)
       return victim_way;
 
-    auto rdp_it = rdp.find(get_pc_signature(pc, false, access_type{type} == access_type::PREFETCH, cpu));
+    auto rdp_it = rdp.find(get_pc_signature(pc, false, access_type{type} == access_type::PREFETCH, triggering_cpu));
     if (rdp_it != rdp.end() && (rdp_it->second > MAX_RD || rdp_it->second / GRANULARITY > max_etr))
       return NUM_WAY;
 
     return victim_way;
   }
 
-  void update_replacement_state(uint32_t cpu, uint32_t set, uint32_t way, uint64_t full_addr, uint64_t pc, uint64_t victim_addr, uint32_t type, uint8_t hit)
+  void update_replacement_state(uint32_t triggering_cpu, uint32_t set, uint32_t way, uint64_t full_addr, uint64_t pc, uint64_t victim_addr, uint32_t type, uint8_t hit)
   {
     if (access_type{type} == access_type::WRITE) {
       if (!hit)
@@ -291,7 +291,7 @@ public:
       return;
     }
 
-    pc = get_pc_signature(pc, hit, access_type{type} == access_type::PREFETCH, cpu);
+    pc = get_pc_signature(pc, hit, access_type{type} == access_type::PREFETCH, triggering_cpu);
 
     if (sampler.is_sampled(set)) {
       std::optional<std::pair<uint64_t, uint32_t>> sample = sampler.get_sample(set, full_addr);
@@ -338,19 +338,24 @@ public:
 
 std::unordered_map<CACHE*, MJData> mjay;
 
-std::unordered_map<CACHE*, uint64_t> access_count;
-std::unordered_map<CACHE*, std::vector<uint64_t>> set_access_count;
+#ifdef PRODUCE_RD_TRACE
+std::unordered_map<CACHE*, uint32_t> access_count;
+std::unordered_map<CACHE*, std::vector<uint32_t>> set_access_count;
 std::unordered_map<CACHE*, std::unordered_map<uint64_t, SamplerEntry>> sampler;
 
-#ifdef PRODUCE_RD_TRACE
 // Let's assume we have only one cache using this
+// Also assume that 32 bits are enough for full cache rds
+// And 16 bits are enough for set rds
 struct traceData {
   uint64_t ip;
   uint64_t addr;
-  uint64_t past_rd;
-  uint64_t past_rd_set;
-  uint64_t future_rd;
-  uint64_t future_rd_set;
+  uint32_t past_rd;
+  uint32_t future_rd;
+  uint16_t past_rd_set;
+  uint16_t future_rd_set;
+
+  traceData(uint64_t _ip, uint64_t _addr, uint32_t _past_rd, uint32_t _future_rd, uint16_t _past_rd_set, uint16_t _future_rd_set) :
+   ip{_ip}, addr{_addr}, past_rd{_past_rd}, future_rd{_future_rd}, past_rd_set{_past_rd_set}, future_rd_set{_future_rd_set} 	{}
 };
 std::vector<traceData> trace;
 #endif
@@ -362,27 +367,28 @@ void CACHE::initialize_replacement()
   mjay.emplace(this, MJData(NUM_SET, NUM_WAY));
 #ifdef PRODUCE_RD_TRACE
   access_count[this] = 0;
-  set_access_count[this].emplace(NUM_SET);
-  for (int i = 0; i < NUM_SET; ++i)
-    set_access_count[this][i] = 0;
-  sampler[this].emplace();
+  set_access_count.try_emplace(this, NUM_SET, 0);
+  assert(set_access_count[this].size() == NUM_SET);
+  //for (int i = 0; i < NUM_SET; ++i)
+  //  set_access_count[this].push_back(0);
+  sampler.try_emplace(this);
 #endif
 }
 
 /* find a cache block to evict
  * return value should be 0 ~ 15 (corresponds to # of ways in cache)
  * current_set: an array of BLOCK, of size 16 */
-uint32_t CACHE::find_victim(uint32_t cpu, uint64_t instr_id, uint32_t set, const BLOCK* current_set, uint64_t pc, uint64_t full_addr, uint32_t type)
+uint32_t CACHE::find_victim(uint32_t triggering_cpu, uint64_t instr_id, uint32_t set, const BLOCK* current_set, uint64_t pc, uint64_t full_addr, uint32_t type)
 {
   // your eviction policy goes here
-  return mjay.at(this).find_victim(cpu, set, pc, type);
+  return mjay.at(this).find_victim(triggering_cpu, set, pc, type);
 }
 
 /* called on every cache hit and cache fill */
-void CACHE::update_replacement_state(uint32_t cpu, uint32_t set, uint32_t way, uint64_t full_addr, uint64_t pc, uint64_t victim_addr, uint32_t type,
+void CACHE::update_replacement_state(uint32_t triggering_cpu, uint32_t set, uint32_t way, uint64_t full_addr, uint64_t pc, uint64_t victim_addr, uint32_t type,
                                      uint8_t hit)
 {
-  mjay.at(this).update_replacement_state(cpu, set, way, full_addr, pc, victim_addr, type, hit);
+  mjay.at(this).update_replacement_state(triggering_cpu, set, way, full_addr, pc, victim_addr, type, hit);
 
 #ifdef PRODUCE_RD_TRACE
   if (access_type{type} == access_type::WRITE)
@@ -394,12 +400,17 @@ void CACHE::update_replacement_state(uint32_t cpu, uint32_t set, uint32_t way, u
   auto it = sampler[this].find(full_addr);
   if (it != sampler[this].end()) {
     uint64_t sample_ip = it->second.ip;
-    uint64_t distance = access_count[this] - it->second.timestamp - 1;
-    uint64_t set_distance = set_access_count[this][set] - it->second.set_timestamp - 1;
+
+    uint32_t distance = access_count[this] - it->second.timestamp - 1;
+    uint32_t set_distance = set_access_count[this][set] - it->second.set_timestamp - 1;
+	// Clamp to 16 bits
+	if (set_distance > std::numeric_limits<uint16_t>::max())
+      set_distance = std::numeric_limits<uint16_t>::max();
+
     sampler[this].erase(it);
-    trace.emplace_back(pc, full_addr, distance, set_distance, std::numeric_limits<uint64_t>::max(), std::numeric_limits<uint64_t>::max());
+    trace.emplace_back(sample_ip, full_addr, static_cast<uint32_t>(distance), std::numeric_limits<uint32_t>::max(), static_cast<uint16_t>(set_distance), std::numeric_limits<uint16_t>::max());
   } else {
-    trace.emplace_back(pc, full_addr, std::numeric_limits<uint64_t>::max(), std::numeric_limits<uint64_t>::max());
+    trace.emplace_back(0, full_addr, std::numeric_limits<uint32_t>::max(), std::numeric_limits<uint32_t>::max(), std::numeric_limits<uint16_t>::max(), std::numeric_limits<uint16_t>::max());
   }
   sampler[this][full_addr] = {pc, access_count[this], set_access_count[this][set]};
 #endif
@@ -412,14 +423,17 @@ void CACHE::replacement_final_stats() {
   for (auto it = trace.rbegin(); it != trace.rend(); ++it) {
     auto entry = last_seen.find(it->addr);
     if (entry != last_seen.end()) {
-      it->future_rd = entry->past_rd;
-      it->future_rd_set = entry->past_rd_set;
+      it->future_rd = entry->second->past_rd;
+      it->future_rd_set = entry->second->past_rd_set;
     }
     last_seen[it->addr] = it;
   }
+
   std::ofstream trace_file("trace.csv");
+  // Remove as many fields as needed
   for (auto it = trace.begin(); it != trace.end(); ++it) {
     trace_file << it->ip << "\t" << it->addr << "\t" << it->past_rd << "\t" << it->past_rd_set << "\t" << it->future_rd << "\t" << it->future_rd_set << "\n";
   }
+
 #endif
 }
