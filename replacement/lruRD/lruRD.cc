@@ -1,155 +1,122 @@
 #include <algorithm>
 #include <cassert>
-#include <iostream>
-#include <map>
-#include <unordered_map>
-#include <vector>
 
-#include "cache.h"
+#include "lruRD.h"
 
 constexpr uint64_t sampler_period{1 << 14};
 constexpr uint64_t max_distance{(1 << 27) - 1};
 
-class RDHistogram {
-  public:
-    RDHistogram() = delete;
-    RDHistogram(uint64_t granularity, uint64_t scale, uint64_t max_distance) :
-      granularity{granularity},
-      log_gran{champsim::msl::lg2(granularity)},
-      scale{scale},
-      max_distance{max_distance},
-      hist(max_bucket + 1) {
-        max_bucket = _quantize(max_distance);
-      };
-
-    void increment(uint64_t ip, size_t distance) {
-      ++hist[quantize(distance)];
-	  auto [hist_it, _] = ip_hist.try_emplace(ip, max_bucket + 1);
-	  ++hist_it->second[quantize(distance)];
-    }
-
-    std::vector<uint64_t>& get() {
-      return hist;
-    }
-
-    uint64_t average() {
-      uint64_t sum = 0;
-      uint64_t count = 0;
-      for (int i = 0; i <= max_bucket; ++i) {
-        count += hist[i];
-        sum += hist[i] * unquantize(i);
-      }
-      return sum / count;
-    }
-    // What other metrics might be relevant?
-
-  private:
-    uint64_t granularity;
-    uint64_t log_gran;
-    uint64_t scale;
-    uint64_t max_distance;
-    uint64_t max_bucket;
-    std::vector<uint64_t> hist;
-	std::unordered_map<uint64_t, std::vector<uint64_t>> ip_hist;
-
-    uint64_t _quantize(uint64_t distance) {
-      distance /= scale;
-
-      if (distance < 2 * granularity)
-        return distance;
-
-      uint64_t shift = champsim::msl::lg2(distance) - log_gran;
-      uint64_t bucket = (distance >> shift) + (shift << log_gran);
-      return bucket;
-    }
-
-    constexpr uint64_t quantize(uint64_t distance) {
-      if (distance > max_distance)
-        return max_bucket;
-      return _quantize(distance);
-    }
-
-    constexpr uint64_t unquantize(uint64_t bucket) {
-      if (bucket < 2 * granularity)
-        return bucket;
-
-      uint64_t shift = bucket >> log_gran;
-      uint64_t distance = ((1ULL << (shift + log_gran - 1)) + (1 << (shift - 1)) * (bucket & (granularity - 1)));
-      return distance * scale;
-    }
+RDHistogram::RDHistogram(uint64_t _granularity, uint64_t _scale, uint64_t _max_distance) :
+  granularity{_granularity},
+  log_gran{champsim::msl::lg2(_granularity)},
+  scale{_scale},
+  max_distance{_max_distance}
+{
+  max_bucket = _quantize(max_distance);
+  hist.resize(max_bucket + 1, 0);
 };
 
-
-
-
-struct SamplerEntry {
-  uint64_t ip;
-  uint64_t timestamp;
-  uint64_t set_timestamp;
-};
-
-
-namespace
-{
-std::map<CACHE*, std::vector<uint64_t>> last_used_cycles;
-
-std::map<CACHE*, uint64_t> access_count;
-std::map<CACHE*, std::vector<uint64_t>> set_access_count;
-std::map<CACHE*, std::unordered_map<uint64_t, SamplerEntry>> sampler;
-std::map<CACHE*, RDHistogram> histogram;
-std::map<CACHE*, std::unordered_map<uint64_t, RDHistogram>> ip_histogram;
-
-std::map<CACHE*, RDHistogram> setrd_histogram;
-std::map<CACHE*, std::unordered_map<uint64_t, RDHistogram>> setrd_ip_histogram;
+void RDHistogram::increment(champsim::address ip, size_t distance) {
+  ++hist[quantize(distance)];
+  auto [hist_it, _] = ip_hist.try_emplace(ip.to<uint64_t>(), max_bucket + 1);
+  ++hist_it->second[quantize(distance)];
 }
 
-void CACHE::initialize_replacement() {
-  ::last_used_cycles[this] = std::vector<uint64_t>(NUM_SET * NUM_WAY);
-  ::access_count[this] = 0;
-  ::set_access_count[this] = std::vector<uint64_t>(NUM_SET);
-  ::sampler[this].emplace();
-  ::histogram.try_emplace(this, 8 * NUM_WAY, NUM_SET / 4, max_distance);
-  ::setrd_histogram.try_emplace(this, 2 * NUM_WAY, 1, max_distance / NUM_SET);
+std::vector<uint64_t>& RDHistogram::get() {
+  return hist;
 }
 
-uint32_t CACHE::find_victim(uint32_t triggering_cpu, uint64_t instr_id, uint32_t set, const BLOCK* current_set, uint64_t ip, uint64_t full_addr, uint32_t type)
+uint64_t RDHistogram::average() {
+  uint64_t sum = 0;
+  uint64_t count = 0;
+  for (unsigned i = 0; i <= max_bucket; ++i) {
+    count += hist[i];
+    sum += hist[i] * unquantize(i);
+  }
+  return sum / count;
+}
+
+uint64_t RDHistogram::_quantize(uint64_t distance) {
+  distance /= scale;
+
+  if (distance < 2 * granularity)
+    return distance;
+
+  uint64_t shift = champsim::msl::lg2(distance) - log_gran;
+  uint64_t bucket = (distance >> shift) + (shift << log_gran);
+  return bucket;
+}
+
+constexpr uint64_t RDHistogram::quantize(uint64_t distance) {
+  if (distance > max_distance)
+    return max_bucket;
+  return _quantize(distance);
+}
+
+constexpr uint64_t RDHistogram::unquantize(uint64_t bucket) {
+  if (bucket < 2 * granularity)
+    return bucket;
+
+  uint64_t shift = bucket >> log_gran;
+  uint64_t distance = ((1ULL << (shift + log_gran - 1)) + (1 << (shift - 1)) * (bucket & (granularity - 1)));
+  return distance * scale;
+}
+
+
+lruRD::lruRD(CACHE* cache) : lruRD(cache, cache->NUM_SET, cache->NUM_WAY) {}
+
+lruRD::lruRD(CACHE* cache, long sets, long ways) :
+  replacement(cache), NUM_WAY(ways),
+  last_used_cycles(static_cast<std::size_t>(sets * ways), 0),
+  set_access_count(static_cast<std::size_t>(sets * ways), 0),
+  sampler{},
+  histogram(8 * ways, sets / 4, max_distance),
+  setrd_histogram(2 * ways, 1, max_distance / sets) {}
+
+long lruRD::find_victim(uint32_t triggering_cpu, uint64_t instr_id, long set, const champsim::cache_block* current_set, champsim::address ip,
+                  champsim::address full_addr, access_type type)
 {
-  auto begin = std::next(std::begin(::last_used_cycles[this]), set * NUM_WAY);
+  auto begin = std::next(std::begin(last_used_cycles), set * NUM_WAY);
   auto end = std::next(begin, NUM_WAY);
 
   // Find the way whose last use cycle is most distant
   auto victim = std::min_element(begin, end);
   assert(begin <= victim);
   assert(victim < end);
-  return static_cast<uint32_t>(std::distance(begin, victim)); // cast protected by prior asserts
+  return std::distance(begin, victim);
 }
 
-void CACHE::update_replacement_state(uint32_t triggering_cpu, uint32_t set, uint32_t way, uint64_t full_addr, uint64_t ip, uint64_t victim_addr, uint32_t type,
-                                     uint8_t hit)
+void lruRD::replacement_cache_fill(uint32_t triggering_cpu, long set, long way, champsim::address full_addr, champsim::address ip, champsim::address victim_addr,
+                             access_type type)
 {
   // Mark the way as being used on the current cycle
-  if (!hit || access_type{type} != access_type::WRITE) // Skip this for writeback hits
-    ::last_used_cycles[this].at(set * NUM_WAY + way) = current_cycle;
-
-  if (access_type{type} == access_type::WRITE)
-	  return;
-
-  ++access_count[this];
-  ++set_access_count[this][set];
-
-  auto it = sampler[this].find(full_addr);
-  if (it != sampler[this].end()) {
-    uint64_t sample_ip = it->second.ip;
-    uint64_t distance = access_count[this] - it->second.timestamp - 1;
-    uint64_t set_distance = set_access_count[this][set] - it->second.set_timestamp - 1;
-    sampler[this].erase(it);
-
-    histogram.at(this).increment(sample_ip, distance);
-    setrd_histogram.at(this).increment(sample_ip, set_distance);
-  }
-
-  if (access_count[this] % sampler_period == 0)
-    sampler[this][full_addr] = {ip, access_count[this], set_access_count[this][set]};
+  last_used_cycles.at((std::size_t)(set * NUM_WAY + way)) = cycle++;
 }
 
-void CACHE::replacement_final_stats(){ }
+void lruRD::update_replacement_state(uint32_t triggering_cpu, long set, long way, champsim::address full_addr, champsim::address ip,
+                               champsim::address victim_addr, access_type type, uint8_t hit)
+{
+  // Mark the way as being used on the current cycle
+  if (hit && access_type{type} != access_type::WRITE) // Skip this for writeback hits
+  last_used_cycles.at((std::size_t)(set * NUM_WAY + way)) = cycle++;
+
+  if (access_type{type} == access_type::WRITE)
+    return;
+
+  ++access_count;
+  ++set_access_count[set];
+
+  auto it = sampler.find(full_addr.to<uint64_t>());
+  if (it != sampler.end()) {
+    champsim::address sample_ip = it->second.ip;
+    uint64_t distance = access_count - it->second.timestamp - 1;
+    uint64_t set_distance = set_access_count[set] - it->second.set_timestamp - 1;
+    sampler.erase(it);
+
+    histogram.increment(sample_ip, distance);
+    setrd_histogram.increment(sample_ip, set_distance);
+  }
+
+  if (access_count % sampler_period == 0)
+    sampler[full_addr.to<uint64_t>()] = {ip, access_count, set_access_count[set]};
+}
